@@ -1,10 +1,10 @@
 __author__ = 'chris'
 
-import bleach
 import json
 import os
 import obelisk
 import nacl.encoding
+import time
 from binascii import unhexlify
 from collections import OrderedDict
 from functools import wraps
@@ -27,12 +27,10 @@ from market.profile import Profile
 from market.contracts import Contract, check_order_for_payment
 from market.btcprice import BtcPrice
 from net.upnp import PortMapper
+from api.utils import sanitize_html
 
 DEFAULT_RECORDS_COUNT = 20
 DEFAULT_RECORDS_OFFSET = 0
-
-ALLOWED_TAGS = ('h2', 'h3', 'h4', 'h5', 'h6', 'p', 'a', 'u', 'ul', 'ol', 'nl', 'li', 'b', 'i', 'strong',
-                'em', 'strike', 'hr', 'br', 'img', 'blockquote', 'span')
 
 
 class OpenBazaarAPI(APIResource):
@@ -131,7 +129,7 @@ class OpenBazaarAPI(APIResource):
             if self.db.filemap.get_file(request.args["hash"][0]) is not None:
                 image_path = self.db.filemap.get_file(request.args["hash"][0])
             else:
-                image_path = DATA_FOLDER + "cache/" + request.args["hash"][0]
+                image_path = os.path.join(DATA_FOLDER, "cache", request.args["hash"][0])
             if not os.path.exists(image_path) and "guid" in request.args:
                 node = None
                 for connection in self.protocol.values():
@@ -175,7 +173,8 @@ class OpenBazaarAPI(APIResource):
                         "pgp_key": profile.pgp_key.public_key,
                         "avatar_hash": profile.avatar_hash.encode("hex"),
                         "header_hash": profile.header_hash.encode("hex"),
-                        "social_accounts": {}
+                        "social_accounts": {},
+                        "last_modified": profile.last_modified
                     }
                 }
                 if temp_handle:
@@ -194,7 +193,7 @@ class OpenBazaarAPI(APIResource):
                         not blockchainid.validate(profile.handle, profile_json["profile"]["guid"])):
                     profile_json["profile"]["handle"] = ""
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(profile_json, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(profile_json), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
@@ -233,13 +232,18 @@ class OpenBazaarAPI(APIResource):
                         "currency_code": l.currency_code,
                         "nsfw": l.nsfw,
                         "origin": str(CountryCode.Name(l.origin)),
-                        "ships_to": []
+                        "ships_to": [],
+                        "last_modified": l.last_modified,
+                        "pinned": l.pinned,
+                        "hidden": l.hidden
                     }
+                    if l.contract_type != 0:
+                        listing_json["contract_type"] = str(objects.Listings.ContractType.Name(l.contract_type))
                     for country in l.ships_to:
                         listing_json["ships_to"].append(str(CountryCode.Name(country)))
                     response["listings"].append(listing_json)
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(response, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(response), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
@@ -267,9 +271,9 @@ class OpenBazaarAPI(APIResource):
     @authenticated
     def get_followers(self, request):
         def parse_followers(followers):
-            if followers is not None:
+            if followers[0] is not None:
                 response = {"followers": []}
-                for f in followers.followers:
+                for f in followers[0].followers:
                     follower_json = {
                         "guid": f.guid.encode("hex"),
                         "handle": f.metadata.handle,
@@ -279,28 +283,33 @@ class OpenBazaarAPI(APIResource):
                         "nsfw": f.metadata.nsfw
                     }
                     response["followers"].append(follower_json)
+                if followers[1] is not None:
+                    response["count"] = followers[1]
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(response, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(response), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
                 request.finish()
+        start = 0
+        if "start" in request.args:
+            start = int(request.args["start"][0])
         if "guid" in request.args:
             def get_node(node):
                 if node is not None:
-                    self.mserver.get_followers(node).addCallback(parse_followers)
+                    self.mserver.get_followers(node, start).addCallback(parse_followers)
                 else:
                     request.write(json.dumps({}))
                     request.finish()
             self.kserver.resolve(unhexlify(request.args["guid"][0])).addCallback(get_node)
         else:
-            ser = self.db.follow.get_followers()
-            if ser is not None:
+            ser = self.db.follow.get_followers(start)
+            if ser[0] is not None:
                 f = objects.Followers()
-                f.ParseFromString(ser)
-                parse_followers(f)
+                f.ParseFromString(ser[0])
+                parse_followers((f, ser[1]))
             else:
-                parse_followers(None)
+                parse_followers((None, 0))
         return server.NOT_DONE_YET
 
     @GET('^/api/v1/get_following')
@@ -320,7 +329,7 @@ class OpenBazaarAPI(APIResource):
                     }
                     response["following"].append(user_json)
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(response, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(response), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
@@ -441,6 +450,7 @@ class OpenBazaarAPI(APIResource):
                 key.public_key = self.keychain.verify_key.encode()
                 key.signature = self.keychain.signing_key.sign(key.public_key)[:64]
                 u.guid_key.MergeFrom(key)
+            u.last_modified = int(time.time())
             p.update(u)
             request.write(json.dumps({"success": True}))
             request.finish()
@@ -492,7 +502,7 @@ class OpenBazaarAPI(APIResource):
         def parse_contract(contract):
             if contract is not None:
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(contract, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(contract), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
@@ -541,6 +551,9 @@ class OpenBazaarAPI(APIResource):
             else:
                 c = Contract(self.db, testnet=self.protocol.testnet)
             c.create(
+                str_to_bool(request.args["pinned"][0]) if "pinned" in request.args else False,
+                int(request.args["max_quantity"][0]) if "max_quantity" in request.args else 999999,
+                str_to_bool(request.args["hidden"][0]) if "hidden" in request.args else False,
                 str(request.args["expiration_date"][0]),
                 request.args["metadata_category"][0],
                 request.args["title"][0].decode("utf8"),
@@ -697,7 +710,9 @@ class OpenBazaarAPI(APIResource):
                                   request.args["country"][0].decode("utf8")
                                   if "country" in request.args else None,
                                   request.args["moderator"][0] if "moderator" in request.args else None,
-                                  options)
+                                  options,
+                                  request.args["alternate_contact"][0].decode("utf8")
+                                  if "alternate_contact" in request.args else None)
 
             def get_node(node):
                 if node is not None:
@@ -724,7 +739,8 @@ class OpenBazaarAPI(APIResource):
                 else:
                     request.write(json.dumps({"success": False, "reason": success}))
                     request.finish()
-            file_path = DATA_FOLDER + "store/contracts/in progress/" + request.args["id"][0] + ".json"
+            file_name = request.args["id"][0] + ".json"
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "in progress", file_name)
             with open(file_path, 'r') as filename:
                 order = json.load(filename, object_pairs_hook=OrderedDict)
             c = Contract(self.db, contract=order, testnet=self.protocol.testnet)
@@ -760,23 +776,23 @@ class OpenBazaarAPI(APIResource):
                 for image in request.args["image"]:
                     img = image.decode('base64')
                     hash_value = digest(img).encode("hex")
-                    with open(DATA_FOLDER + "store/media/" + hash_value, 'wb') as outfile:
+                    with open(os.path.join(DATA_FOLDER, "store", "media", hash_value), 'wb') as outfile:
                         outfile.write(img)
-                    self.db.filemap.insert(hash_value, DATA_FOLDER + "store/media/" + hash_value)
+                    self.db.filemap.insert(hash_value, os.path.join("store", "media", hash_value))
                     ret.append(hash_value)
             elif "avatar" in request.args:
                 avi = request.args["avatar"][0].decode("base64")
                 hash_value = digest(avi).encode("hex")
-                with open(DATA_FOLDER + "store/avatar", 'wb') as outfile:
+                with open(os.path.join(DATA_FOLDER, "store", "avatar"), 'wb') as outfile:
                     outfile.write(avi)
-                self.db.filemap.insert(hash_value, DATA_FOLDER + "store/avatar")
+                self.db.filemap.insert(hash_value, os.path.join("store", "avatar"))
                 ret.append(hash_value)
             elif "header" in request.args:
                 hdr = request.args["header"][0].decode("base64")
                 hash_value = digest(hdr).encode("hex")
-                with open(DATA_FOLDER + "store/header", 'wb') as outfile:
+                with open(os.path.join(DATA_FOLDER, "store", "header"), 'wb') as outfile:
                     outfile.write(hdr)
-                self.db.filemap.insert(hash_value, DATA_FOLDER + "store/header")
+                self.db.filemap.insert(hash_value, os.path.join("store", "header"))
                 ret.append(hash_value)
             request.write(json.dumps({"success": True, "image_hashes": ret}, indent=4))
             request.finish()
@@ -796,9 +812,9 @@ class OpenBazaarAPI(APIResource):
             else:
                 request.write(json.dumps({"success": False, "reason": success}))
                 request.finish()
-        file_path = DATA_FOLDER + "purchases/in progress/" + request.args["id"][0] + ".json"
+        file_path = os.path.join(DATA_FOLDER, "purchases", "in progress", request.args["id"][0] + ".json")
         if not os.path.exists(file_path):
-            file_path = DATA_FOLDER + "purchases/trade receipts/" + request.args["id"][0] + ".json"
+            file_path = os.path.join(DATA_FOLDER, "purchases", "trade receipts", request.args["id"][0] + ".json")
         with open(file_path, 'r') as filename:
             order = json.load(filename, object_pairs_hook=OrderedDict)
         c = Contract(self.db, contract=order, testnet=self.protocol.testnet)
@@ -844,6 +860,14 @@ class OpenBazaarAPI(APIResource):
             if resolver != get_value("CONSTANTS", "RESOLVER"):
                 set_value("CONSTANTS", "RESOLVER", resolver)
 
+            if "smtp_notifications" not in request.args:
+                request.args["smtp_notifications"] = ['false']
+
+            smtp_attrs = ["smtp_server", "smtp_sender", "smtp_recipient", "smtp_username", "smtp_password"]
+            for smtp_attr in smtp_attrs:
+                if smtp_attr not in request.args:
+                    request.args[smtp_attr] = ['']
+
             settings_list = settings.get()
             if "moderators" in request.args and settings_list is not None:
                 mod_json = settings_list[11]
@@ -866,7 +890,13 @@ class OpenBazaarAPI(APIResource):
                 json.dumps(request.args["blocked"] if request.args["blocked"] != "" else []),
                 request.args["terms_conditions"][0],
                 request.args["refund_policy"][0],
-                json.dumps(request.args["moderators"] if request.args["moderators"] != "" else [])
+                json.dumps(request.args["moderators"] if request.args["moderators"] != "" else []),
+                1 if str_to_bool(request.args["smtp_notifications"][0]) else 0,
+                request.args["smtp_server"][0],
+                request.args["smtp_sender"][0],
+                request.args["smtp_recipient"][0],
+                request.args["smtp_username"][0],
+                request.args["smtp_password"][0]
             )
 
             request.write(json.dumps({"success": True}, indent=4))
@@ -902,13 +932,19 @@ class OpenBazaarAPI(APIResource):
                 "blocked_guids": json.loads(settings[8]),
                 "libbitcoin_server": get_value(
                     "LIBBITCOIN_SERVERS_TESTNET", "testnet_server_custom")if self.protocol.testnet else get_value(
-                        "LIBBITCOIN_SERVERS", "server_custom"),
+                        "LIBBITCOIN_SERVERS", "mainnet_server_custom"),
                 "seed": KeyChain(self.db).signing_key.encode(encoder=nacl.encoding.HexEncoder),
                 "terms_conditions": "" if settings[9] is None else settings[9],
                 "refund_policy": "" if settings[10] is None else settings[10],
                 "resolver": get_value("CONSTANTS", "RESOLVER"),
                 "network_connection": nat_type,
-                "transaction_fee": TRANSACTION_FEE
+                "transaction_fee": TRANSACTION_FEE,
+                "smtp_notifications": True if settings[14] == 1 else False,
+                "smtp_server": settings[15],
+                "smtp_sender": settings[16],
+                "smtp_recipient": settings[17],
+                "smtp_username": settings[18],
+                "smtp_password": settings[19],
             }
             mods = []
             try:
@@ -928,7 +964,7 @@ class OpenBazaarAPI(APIResource):
                 pass
             settings_json["moderators"] = mods
             request.setHeader('content-type', "application/json")
-            request.write(bleach.clean(json.dumps(settings_json, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+            request.write(json.dumps(sanitize_html(settings_json), indent=4))
             request.finish()
         return server.NOT_DONE_YET
 
@@ -941,7 +977,7 @@ class OpenBazaarAPI(APIResource):
             "num_peers": len(peers),
             "peers": peers
         }
-        request.write(bleach.clean(json.dumps(resp, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(resp), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -960,7 +996,7 @@ class OpenBazaarAPI(APIResource):
                 }
                 nodes.append(n)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(nodes, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(nodes), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -988,7 +1024,7 @@ class OpenBazaarAPI(APIResource):
             }
             notification_dict["notifications"].append(notification_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(notification_dict, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(notification_dict), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1039,7 +1075,7 @@ class OpenBazaarAPI(APIResource):
             }
             message_list.append(message_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(message_list, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(message_list), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1048,7 +1084,7 @@ class OpenBazaarAPI(APIResource):
     def get_chat_conversations(self, request):
         messages = self.db.messages.get_conversations()
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(messages, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(messages, indent=4).encode("utf-8"))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1081,7 +1117,10 @@ class OpenBazaarAPI(APIResource):
     @GET('^/api/v1/get_sales')
     @authenticated
     def get_sales(self, request):
-        sales = self.db.sales.get_all()
+        if "status" in request.args:
+            sales = self.db.sales.get_by_status(request.args["status"][0])
+        else:
+            sales = self.db.sales.get_all()
         sales_list = []
         for sale in sales:
             sale_json = {
@@ -1093,11 +1132,13 @@ class OpenBazaarAPI(APIResource):
                 "status": sale[5],
                 "thumbnail_hash": sale[6],
                 "buyer": sale[7],
-                "contract_type": sale[8]
+                "contract_type": sale[8],
+                "unread": sale[9],
+                "status_changed": False if sale[10] == 0 else True
             }
             sales_list.append(sale_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(sales_list, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(sales_list), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1116,11 +1157,13 @@ class OpenBazaarAPI(APIResource):
                 "status": purchase[5],
                 "thumbnail_hash": purchase[6],
                 "vendor": purchase[7],
-                "contract_type": purchase[8]
+                "contract_type": purchase[8],
+                "unread": purchase[9],
+                "status_changed": False if purchase[10] == 0 else True
             }
             purchases_list.append(purchase_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(purchases_list, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(purchases_list), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1150,27 +1193,34 @@ class OpenBazaarAPI(APIResource):
         #TODO: if this is either a funded direct payment sale or complete moderated sale but
         #TODO: the payout tx has not hit the blockchain, rebroadcast.
 
-        if os.path.exists(DATA_FOLDER + "purchases/unfunded/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "purchases/unfunded/" + request.args["order_id"][0] + ".json"
+        filename = request.args["order_id"][0] + ".json"
+        if os.path.exists(os.path.join(DATA_FOLDER, "purchases", "unfunded", filename)):
+            file_path = os.path.join(DATA_FOLDER, "purchases", "unfunded", filename)
             status = self.db.purchases.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER + "purchases/in progress/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "purchases/in progress/" + request.args["order_id"][0] + ".json"
+            self.db.purchases.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "purchases", "in progress", filename)):
+            file_path = os.path.join(DATA_FOLDER, "purchases", "in progress", filename)
             status = self.db.purchases.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER + "purchases/trade receipts/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "purchases/trade receipts/" + request.args["order_id"][0] + ".json"
+            self.db.purchases.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "purchases", "trade receipts", filename)):
+            file_path = os.path.join(DATA_FOLDER, "purchases", "trade receipts", filename)
             status = self.db.purchases.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER + "store/contracts/unfunded/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "store/contracts/unfunded/" + request.args["order_id"][0] + ".json"
+            self.db.purchases.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "store", "contracts", "unfunded", filename)):
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "unfunded", filename)
             status = self.db.sales.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER + "store/contracts/in progress/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "store/contracts/in progress/" + request.args["order_id"][0] + ".json"
+            self.db.sales.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "store", "contracts", "in progress", filename)):
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "in progress", filename)
             status = self.db.sales.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER +
-                            "store/contracts/trade receipts/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "store/contracts/trade receipts/" + request.args["order_id"][0] + ".json"
+            self.db.sales.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "store", "contracts", "trade receipts", filename)):
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "trade receipts", filename)
             status = self.db.sales.get_status(request.args["order_id"][0])
-        elif os.path.exists(DATA_FOLDER + "cases/" + request.args["order_id"][0] + ".json"):
-            file_path = DATA_FOLDER + "cases/" + request.args["order_id"][0] + ".json"
+            self.db.sales.status_changed(request.args["order_id"][0], 0)
+        elif os.path.exists(os.path.join(DATA_FOLDER, "cases", filename)):
+            file_path = os.path.join(DATA_FOLDER, "cases", filename)
+            self.db.cases.status_changed(request.args["order_id"][0], 0)
             status = 4
         else:
             request.write(json.dumps({}, indent=4))
@@ -1180,14 +1230,14 @@ class OpenBazaarAPI(APIResource):
         with open(file_path, 'r') as filename:
             order = json.load(filename, object_pairs_hook=OrderedDict)
 
-        if status == 0:
+        if status == 0 or status == 2:
             check_order_for_payment(request.args["order_id"][0], self.db, self.protocol.blockchain,
                                     self.mserver.protocol.get_notification_listener(),
                                     self.protocol.testnet)
 
         def return_order():
             request.setHeader('content-type', "application/json")
-            request.write(bleach.clean(json.dumps(order, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+            request.write(json.dumps(sanitize_html(order), indent=4))
             request.finish()
 
         def height_fetched(ec, chain_height):
@@ -1297,11 +1347,13 @@ class OpenBazaarAPI(APIResource):
                 "buyer": case[6],
                 "vendor": case[7],
                 "validation": json.loads(case[8]),
-                "status": "closed" if case[10] == 1 else "open"
+                "status": "closed" if case[10] == 1 else "open",
+                "unread": case[11],
+                "status_changed": False if case[12] == 0 else True
             }
             cases_list.append(purchase_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(cases_list, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(cases_list), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1323,7 +1375,7 @@ class OpenBazaarAPI(APIResource):
                 }
                 message_list.append(message_json)
         request.setHeader('content-type', "application/json")
-        request.write(bleach.clean(json.dumps(message_list, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+        request.write(json.dumps(sanitize_html(message_list), indent=4))
         request.finish()
         return server.NOT_DONE_YET
 
@@ -1333,7 +1385,7 @@ class OpenBazaarAPI(APIResource):
         def parse_response(ratings):
             if ratings is not None:
                 request.setHeader('content-type', "application/json")
-                request.write(bleach.clean(json.dumps(ratings, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+                request.write(json.dumps(sanitize_html(ratings), indent=4))
                 request.finish()
             else:
                 request.write(json.dumps({}))
@@ -1359,7 +1411,7 @@ class OpenBazaarAPI(APIResource):
                 for rating in self.db.ratings.get_all_ratings():
                     ratings.append(json.loads(rating[0]))
             request.setHeader('content-type', "application/json")
-            request.write(bleach.clean(json.dumps(ratings, indent=4), tags=ALLOWED_TAGS).encode("utf-8"))
+            request.write(json.dumps(sanitize_html(ratings), indent=4))
             request.finish()
         return server.NOT_DONE_YET
 
@@ -1391,6 +1443,19 @@ class OpenBazaarAPI(APIResource):
                     request.write(json.dumps({"success": False, "reason": success}))
                     request.finish()
             self.mserver.refund(request.args["order_id"][0]).addCallback(respond)
+            return server.NOT_DONE_YET
+        except Exception, e:
+            request.write(json.dumps({"success": False, "reason": e.message}, indent=4))
+            request.finish()
+            return server.NOT_DONE_YET
+
+    @POST('^/api/v1/mark_discussion_as_read')
+    @authenticated
+    def mark_discussion_as_read(self, request):
+        try:
+            self.db.purchases.update_unread(request.args["id"][0], reset=True)
+            self.db.sales.update_unread(request.args["id"][0], reset=True)
+            self.db.cases.update_unread(request.args["id"][0], reset=True)
             return server.NOT_DONE_YET
         except Exception, e:
             request.write(json.dumps({"success": False, "reason": e.message}, indent=4))

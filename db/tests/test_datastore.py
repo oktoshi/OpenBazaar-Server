@@ -3,6 +3,7 @@ import unittest
 import time
 from db.datastore import Database
 from dht.utils import digest
+from config import DATA_FOLDER
 from protos.objects import Profile, Listings, Following, Metadata, Followers, Node, FULL_CONE
 from protos.countries import CountryCode
 
@@ -74,12 +75,12 @@ class DatastoreTest(unittest.TestCase):
     def test_hashmapInsert(self):
         self.hm.insert(self.test_hash, self.test_file)
         f = self.hm.get_file(self.test_hash)
-        self.assertEqual(f, self.test_file)
+        self.assertEqual(f, DATA_FOLDER + self.test_file)
 
     def test_hashmapDelete(self):
         self.hm.insert(self.test_hash, self.test_file)
         f = self.hm.get_file(self.test_hash)
-        self.assertEqual(f, self.test_file)
+        self.assertEqual(f, DATA_FOLDER + self.test_file)
         self.hm.delete(self.test_hash)
         v = self.hm.get_file(self.test_hash)
         self.assertIsNone(v)
@@ -162,13 +163,13 @@ class DatastoreTest(unittest.TestCase):
         self.assertFalse(self.fd.is_following(self.u.guid))
 
     def test_deleteFollower(self):
-        self.fd.set_follower(self.f)
-        self.fd.set_follower(self.f)
+        self.fd.set_follower(self.f.SerializeToString())
+        self.fd.set_follower(self.f.SerializeToString())
         f = self.fd.get_followers()
         self.assertIsNotNone(f)
         self.fd.delete_follower(self.f.guid)
         f = self.fd.get_followers()
-        self.assertEqual(f, '')
+        self.assertEqual(f[0], '')
 
     def test_MassageStore(self):
         msgs = self.ms.get_messages(self.u.guid, 'CHAT')
@@ -185,7 +186,7 @@ class DatastoreTest(unittest.TestCase):
         self.assertEqual(1, len(msgs))
 
         guids = self.ms.get_unread()
-        self.assertEqual(1, len(guids))
+        self.assertEqual(0, len(guids))
 
         conversations = self.ms.get_conversations()
         self.assertEqual(1, len(conversations))
@@ -334,12 +335,12 @@ class DatastoreTest(unittest.TestCase):
         self.assertEqual(v, {})
 
     def test_Settings(self):
-        NUM_SETTINGS = 14
+        NUM_SETTINGS = 20
         settings = self.settings.get()
         self.assertIsNone(settings)
 
         self.settings.update('NEW_ADDRESS', 'BTC', 'AUSTRALIA', 'EN',
-                             '', '', '', '', '', '', '')
+                             '', '', '', '', '', '', '', '', '', '', '', '', '')
         settings = self.settings.get()
         self.assertEqual(NUM_SETTINGS, len(settings))
 

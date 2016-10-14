@@ -68,6 +68,8 @@ class OpenBazaarProtocol(ConnectionMultiplexer):
             self.is_new_node = True
             self.on_connection_made()
             self.time_last_message = 0
+            self.remote_node_version = 1
+            self.ping_interval = 30 if nat_type != FULL_CONE else 300
 
         def on_connection_made(self):
             if self.connection is None or self.connection.state == State.CONNECTING:
@@ -75,12 +77,10 @@ class OpenBazaarProtocol(ConnectionMultiplexer):
             if self.connection.state == State.CONNECTED:
                 self.addr = str(self.connection.dest_addr[0]) + ":" + str(self.connection.dest_addr[1])
                 self.log.info("connected to %s" % self.addr)
-            self.ban_score.process_message(self.connection.dest_addr, 100)
 
         def receive_message(self, datagram):
             if len(datagram) < 166:
                 self.log.warning("received datagram too small from %s, ignoring" % self.addr)
-                self.ban_score.process_message(self.connection.dest_addr, 110)
                 return False
             try:
                 m = Message()
@@ -93,6 +93,7 @@ class OpenBazaarProtocol(ConnectionMultiplexer):
                                  (m.sender.relayAddress.ip, m.sender.relayAddress.port),
                                  m.sender.natType,
                                  m.sender.vendor)
+                self.remote_node_version = m.protoVer
                 if self.time_last_message == 0:
                     h = nacl.hash.sha512(m.sender.publicKey)
                     pow_hash = h[40:]
@@ -106,7 +107,6 @@ class OpenBazaarProtocol(ConnectionMultiplexer):
             except Exception:
                 # If message isn't formatted property then ignore
                 self.log.warning("received an invalid message from %s, ignoring" % self.addr)
-                self.ban_score.process_message(self.connection.dest_addr, 110)
                 return False
 
         def handle_shutdown(self):
@@ -144,7 +144,8 @@ class OpenBazaarProtocol(ConnectionMultiplexer):
             ):
                 self.connection.shutdown()
                 return
-            if t - self.time_last_message >= 30:
+
+            if t - self.time_last_message >= self.ping_interval:
                 for processor in self.processors:
                     if PING in processor and self.node is not None:
                         processor.callPing(self.node)

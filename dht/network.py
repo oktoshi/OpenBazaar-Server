@@ -66,7 +66,8 @@ class Server(object):
         self.storage = storage or ForgetfulStorage()
         self.node = node
         self.protocol = KademliaProtocol(self.node, self.storage, ksize, db, signing_key)
-        self.refreshLoop = LoopingCall(self.refreshTable).start(3600)
+        self.refreshLoop = LoopingCall(self.refreshTable)
+        reactor.callLater(1800, self.refreshLoop.start, 3600)
 
     def listen(self, port):
         """
@@ -93,9 +94,10 @@ class Server(object):
             ds.append(spider.find())
 
         def republishKeys(_):
-            for bucket in self.protocol.router.buckets:
-                for node in bucket.nodes.values():
-                    self.protocol.transferKeyValues(node)
+            self.log.debug("Republishing key/values...")
+            neighbors = self.protocol.router.findNeighbors(self.node, exclude=self.node)
+            for node in neighbors:
+                self.protocol.transferKeyValues(node)
 
         return defer.gatherResults(ds).addCallback(republishKeys)
 
@@ -151,7 +153,7 @@ class Server(object):
         neighbors = self.protocol.router.findNeighbors(self.node)
         return [tuple(n)[-2:] for n in neighbors]
 
-    def bootstrap(self, addrs):
+    def bootstrap(self, addrs, deferred=None):
         """
         Bootstrap the server by connecting to other known nodes in the network.
 
@@ -165,12 +167,17 @@ class Server(object):
             return task.deferLater(reactor, 1, self.bootstrap, addrs)
         self.log.info("bootstrapping with %s addresses, finding neighbors..." % len(addrs))
 
-        d = defer.Deferred()
+        if deferred is None:
+            d = defer.Deferred()
+        else:
+            d = deferred
 
         def initTable(results):
+            response = False
             potential_relay_nodes = []
             for addr, result in results.items():
                 if result[0]:
+                    response = True
                     n = objects.Node()
                     try:
                         n.ParseFromString(result[1][0])
@@ -188,6 +195,12 @@ class Server(object):
                             potential_relay_nodes.append((addr[0], addr[1]))
                     except Exception:
                         self.log.warning("bootstrap node returned invalid GUID")
+            if not response:
+                if self.protocol.multiplexer.testnet:
+                    self.bootstrap(self.querySeed(SEEDS_TESTNET), d)
+                else:
+                    self.bootstrap(self.querySeed(SEEDS), d)
+                return
             if len(potential_relay_nodes) > 0 and self.node.nat_type != objects.FULL_CONE:
                 shuffle(potential_relay_nodes)
                 self.node.relay_node = potential_relay_nodes[0]
@@ -233,8 +246,6 @@ class Server(object):
             :class:`None` if not found, the value otherwise.
         """
         dkey = digest(keyword)
-        if self.storage.get(dkey) is not None:
-            return defer.succeed(self.storage.get(dkey))
         node = Node(dkey)
         nearest = self.protocol.router.findNeighbors(node)
         if len(nearest) == 0:

@@ -13,7 +13,9 @@ import obelisk
 import os.path
 import pickle
 import time
+import struct
 from binascii import unhexlify
+from bitcoin.core import b2lx
 from collections import OrderedDict
 from config import DATA_FOLDER, TRANSACTION_FEE
 from dht.node import Node
@@ -191,11 +193,11 @@ class Server(object):
                     if not gpg.verify(p.pgp_key.signature) or \
                                     node_to_ask.id.encode('hex') not in p.pgp_key.signature:
                         p.ClearField("pgp_key")
-                if not os.path.isfile(DATA_FOLDER + 'cache/' + p.avatar_hash.encode("hex")):
+                if not os.path.isfile(os.path.join(DATA_FOLDER, 'cache', p.avatar_hash.encode("hex"))):
                     self.get_image(node_to_ask, p.avatar_hash)
-                if not os.path.isfile(DATA_FOLDER + 'cache/' + p.header_hash.encode("hex")):
+                if not os.path.isfile(os.path.join(DATA_FOLDER, 'cache', p.header_hash.encode("hex"))):
                     self.get_image(node_to_ask, p.header_hash)
-                self.cache(result[1][0], node_to_ask.id.encode("hex"))
+                self.cache(result[1][0], node_to_ask.id.encode("hex") + ".profile")
                 return p
             except Exception:
                 return None
@@ -220,7 +222,7 @@ class Server(object):
                 verify_key.verify(result[1][0], result[1][1])
                 m = objects.Metadata()
                 m.ParseFromString(result[1][0])
-                if not os.path.isfile(DATA_FOLDER + 'cache/' + m.avatar_hash.encode("hex")):
+                if not os.path.isfile(os.path.join(DATA_FOLDER, 'cache', m.avatar_hash.encode("hex"))):
                     self.get_image(node_to_ask, m.avatar_hash)
                 return m
             except Exception:
@@ -269,7 +271,7 @@ class Server(object):
                 l = objects.Listings().ListingMetadata()
                 l.ParseFromString(result[1][0])
                 if l.thumbnail_hash != "":
-                    if not os.path.isfile(DATA_FOLDER + 'cache/' + l.thumbnail_hash.encode("hex")):
+                    if not os.path.isfile(os.path.join(DATA_FOLDER, 'cache', l.thumbnail_hash.encode("hex"))):
                         self.get_image(node_to_ask, l.thumbnail_hash)
                 return l
             except Exception:
@@ -373,7 +375,7 @@ class Server(object):
         self.log.info("sending unfollow request to %s" % node_to_unfollow)
         return d.addCallback(save_to_db)
 
-    def get_followers(self, node_to_ask):
+    def get_followers(self, node_to_ask, start=0):
         """
         Query the given node for a list if its followers. The response will be a
         `Followers` protobuf object. We will verify the signature for each follower
@@ -388,8 +390,11 @@ class Server(object):
                 verify_key.verify(response[1][0], response[1][1])
                 f.ParseFromString(response[1][0])
             except Exception:
-                return None
+                return (None, None)
             # Verify the signature and guid of each follower.
+            count = None
+            if len(response[1]) > 2:
+                count = response[1][2]
             for follower in f.followers:
                 try:
                     v_key = nacl.signing.VerifyKey(follower.pubkey)
@@ -404,9 +409,14 @@ class Server(object):
                         raise Exception('Invalid follower')
                 except Exception:
                     f.followers.remove(follower)
-            return f
+            return (f, count)
 
-        d = self.protocol.callGetFollowers(node_to_ask)
+        peer = (node_to_ask.ip, node_to_ask.port)
+        if peer in self.protocol.multiplexer and \
+                        self.protocol.multiplexer[peer].handler.remote_node_version > 1:
+            d = self.protocol.callGetFollowers(node_to_ask, start=start)
+        else:
+            d = self.protocol.callGetFollowers(node_to_ask)
         self.log.info("fetching followers from %s" % node_to_ask)
         return d.addCallback(get_response)
 
@@ -706,7 +716,7 @@ class Server(object):
         it in the DHT for them.
         """
         try:
-            file_path = DATA_FOLDER + "purchases/in progress/" + order_id + ".json"
+            file_path = os.path.join(DATA_FOLDER, "purchases", "in progress", order_id + ".json")
             with open(file_path, 'r') as filename:
                 contract = json.load(filename, object_pairs_hook=OrderedDict)
                 guid = contract["vendor_offer"]["listing"]["id"]["guid"]
@@ -717,7 +727,7 @@ class Server(object):
                 proof_sig = self.db.purchases.get_proof_sig(order_id)
         except Exception:
             try:
-                file_path = DATA_FOLDER + "store/contracts/in progress/" + order_id + ".json"
+                file_path = os.path.join(DATA_FOLDER, "store", "contracts", "in progress", order_id + ".json")
                 with open(file_path, 'r') as filename:
                     contract = json.load(filename, object_pairs_hook=OrderedDict)
                     guid = contract["buyer_order"]["order"]["id"]["guid"]
@@ -793,6 +803,10 @@ class Server(object):
         Called when a moderator closes a dispute. It will create a payout transactions refunding both
         parties and send it to them in a dispute_close message.
         """
+        if float(vendor_percentage) < 0 or float(moderator_percentage) < 0 or float(buyer_percentage) < 0:
+            raise Exception("Payouts percentages must be positive")
+        if float(vendor_percentage) + float(buyer_percentage) > 1:
+            raise Exception("Payout exceeds 100% of value")
         if not self.protocol.multiplexer.blockchain.connected:
             raise Exception("Libbitcoin server not online")
         if not self.protocol.multiplexer.testnet and \
@@ -806,7 +820,7 @@ class Server(object):
         except AssertionError:
             raise Exception("Invalid Bitcoin address")
 
-        with open(DATA_FOLDER + "cases/" + order_id + ".json", "r") as filename:
+        with open(os.path.join(DATA_FOLDER, "cases", order_id + ".json"), "r") as filename:
             contract = json.load(filename, object_pairs_hook=OrderedDict)
 
         buyer_address = contract["buyer_order"]["order"]["refund_address"]
@@ -843,51 +857,54 @@ class Server(object):
                         if o not in outpoints:
                             outpoints.append(o)
 
-                satoshis -= TRANSACTION_FEE
-                moderator_fee = int(float(moderator_percentage) * satoshis)
-                satoshis -= moderator_fee
+                if satoshis <= 0:
+                    d.callback(False)
+                else:
+                    satoshis -= TRANSACTION_FEE
+                    moderator_fee = int(float(moderator_percentage) * satoshis)
+                    satoshis -= moderator_fee
 
-                if moderator_fee > 0:
-                    outputs.append({'value': moderator_fee, 'address': moderator_address})
-                dispute_json["dispute_resolution"]["resolution"]["moderator_address"] = moderator_address
-                dispute_json["dispute_resolution"]["resolution"]["moderator_fee"] = \
-                    round(moderator_fee / float(100000000), 8)
-                dispute_json["dispute_resolution"]["resolution"]["transaction_fee"] = \
-                    round(TRANSACTION_FEE / float(100000000), 8)
-                if float(buyer_percentage) > 0:
-                    amt = int(float(buyer_percentage) * satoshis)
-                    dispute_json["dispute_resolution"]["resolution"]["buyer_payout"] = \
-                        round(amt / float(100000000), 8)
-                    outputs.append({'value': amt,
-                                    'address': buyer_address})
-                if float(vendor_percentage) > 0:
-                    amt = int(float(vendor_percentage) * satoshis)
-                    dispute_json["dispute_resolution"]["resolution"]["vendor_payout"] = \
-                        round(amt / float(100000000), 8)
-                    outputs.append({'value': amt,
-                                    'address': vendor_address})
+                    if moderator_fee > 0:
+                        outputs.append({'value': moderator_fee, 'address': moderator_address})
+                    dispute_json["dispute_resolution"]["resolution"]["moderator_address"] = moderator_address
+                    dispute_json["dispute_resolution"]["resolution"]["moderator_fee"] = \
+                        round(moderator_fee / float(100000000), 8)
+                    dispute_json["dispute_resolution"]["resolution"]["transaction_fee"] = \
+                        round(TRANSACTION_FEE / float(100000000), 8)
+                    if float(buyer_percentage) > 0:
+                        amt = int(float(buyer_percentage) * satoshis)
+                        dispute_json["dispute_resolution"]["resolution"]["buyer_payout"] = \
+                            round(amt / float(100000000), 8)
+                        outputs.append({'value': amt,
+                                        'address': buyer_address})
+                    if float(vendor_percentage) > 0:
+                        amt = int(float(vendor_percentage) * satoshis)
+                        dispute_json["dispute_resolution"]["resolution"]["vendor_payout"] = \
+                            round(amt / float(100000000), 8)
+                        outputs.append({'value': amt,
+                                        'address': vendor_address})
 
-                tx = BitcoinTransaction.make_unsigned(outpoints, outputs,
-                                                      testnet=self.protocol.multiplexer.testnet)
-                chaincode = contract["buyer_order"]["order"]["payment"]["chaincode"]
-                redeem_script = str(contract["buyer_order"]["order"]["payment"]["redeem_script"])
-                masterkey_m = bitcointools.bip32_extract_key(KeyChain(self.db).bitcoin_master_privkey)
-                moderator_priv = derive_childkey(masterkey_m, chaincode, bitcointools.MAINNET_PRIVATE)
+                    tx = BitcoinTransaction.make_unsigned(outpoints, outputs,
+                                                          testnet=self.protocol.multiplexer.testnet)
+                    chaincode = contract["buyer_order"]["order"]["payment"]["chaincode"]
+                    redeem_script = str(contract["buyer_order"]["order"]["payment"]["redeem_script"])
+                    masterkey_m = bitcointools.bip32_extract_key(KeyChain(self.db).bitcoin_master_privkey)
+                    moderator_priv = derive_childkey(masterkey_m, chaincode, bitcointools.MAINNET_PRIVATE)
 
-                signatures = tx.create_signature(moderator_priv, redeem_script)
-                dispute_json["dispute_resolution"]["resolution"]["order_id"] = order_id
-                dispute_json["dispute_resolution"]["resolution"]["tx_signatures"] = signatures
-                dispute_json["dispute_resolution"]["resolution"]["claim"] = self.db.cases.get_claim(order_id)
-                dispute_json["dispute_resolution"]["resolution"]["decision"] = resolution
-                dispute_json["dispute_resolution"]["signature"] = \
-                    base64.b64encode(KeyChain(self.db).signing_key.sign(json.dumps(
-                        dispute_json["dispute_resolution"]["resolution"], indent=4))[:64])
+                    signatures = tx.create_signature(moderator_priv, redeem_script)
+                    dispute_json["dispute_resolution"]["resolution"]["order_id"] = order_id
+                    dispute_json["dispute_resolution"]["resolution"]["tx_signatures"] = signatures
+                    dispute_json["dispute_resolution"]["resolution"]["claim"] = self.db.cases.get_claim(order_id)
+                    dispute_json["dispute_resolution"]["resolution"]["decision"] = resolution
+                    dispute_json["dispute_resolution"]["signature"] = \
+                        base64.b64encode(KeyChain(self.db).signing_key.sign(json.dumps(
+                            dispute_json["dispute_resolution"]["resolution"], indent=4))[:64])
 
-                contract["dispute_resolution"] = dispute_json["dispute_resolution"]
-                with open(DATA_FOLDER + "cases/" + order_id + ".json", 'wb') as outfile:
-                    outfile.write(json.dumps(contract, indent=4))
+                    contract["dispute_resolution"] = dispute_json["dispute_resolution"]
+                    with open(DATA_FOLDER + "cases/" + order_id + ".json", 'wb') as outfile:
+                        outfile.write(json.dumps(contract, indent=4))
 
-                send(dispute_json)
+                    send(dispute_json)
 
         def send(dispute_json):
             def get_node(node_to_ask, recipient_guid, public_key):
@@ -938,11 +955,12 @@ class Server(object):
         This function should be called to release funds from a disputed contract after
         the moderator has resolved the dispute and provided his signature.
         """
-        if os.path.exists(DATA_FOLDER + "purchases/in progress/" + order_id + ".json"):
-            file_path = DATA_FOLDER + "purchases/in progress/" + order_id + ".json"
+
+        if os.path.exists(os.path.join(DATA_FOLDER, "purchases", "in progress", order_id + ".json")):
+            file_path = os.path.join(DATA_FOLDER, "purchases", "in progress", order_id + ".json")
             outpoints = json.loads(self.db.purchases.get_outpoint(order_id))
-        elif os.path.exists(DATA_FOLDER + "store/contracts/in progress/" + order_id + ".json"):
-            file_path = DATA_FOLDER + "store/contracts/in progress/" + order_id + ".json"
+        elif os.path.exists(os.path.join(DATA_FOLDER, "store", "contracts", "in progress", order_id + ".json")):
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "in progress", order_id + ".json")
             outpoints = json.loads(self.db.sales.get_outpoint(order_id))
 
         with open(file_path, 'r') as filename:
@@ -968,6 +986,16 @@ class Server(object):
                                                      ["resolution"]["vendor_payout"]) * 100000000)),
                             'address': vendor_address})
 
+        # version 0.2.1 and above ensure same sort order as moderator.
+        o = []
+        for s in contract["dispute_resolution"]["resolution"]["tx_signatures"]:
+            if "outpoint" in s:
+                for outpoint in outpoints:
+                    ser = outpoint["txid"] + b2lx(struct.pack(b"<I", outpoint["vout"]))
+                    if ser == s["outpoint"]:
+                        o.append(outpoint)
+        if len(o) != 0:
+            outpoints = o
         tx = BitcoinTransaction.make_unsigned(outpoints, outputs, testnet=self.protocol.multiplexer.testnet)
         chaincode = contract["buyer_order"]["order"]["payment"]["chaincode"]
         redeem_script = str(contract["buyer_order"]["order"]["payment"]["redeem_script"])
@@ -1053,9 +1081,9 @@ class Server(object):
         immediately broadcast to the Bitcoin network otherwise the refund message sent
         to the buyer with contain the signature.
         """
-        file_path = DATA_FOLDER + "store/contracts/in progress/" + order_id + ".json"
+        file_path = os.path.join(DATA_FOLDER + "store", "contracts", "in progress", order_id + ".json")
         if not os.path.exists(file_path):
-            file_path = DATA_FOLDER + "store/contracts/trade receipts/" + order_id + ".json"
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "trade receipts", order_id + ".json")
         outpoints = json.loads(self.db.sales.get_outpoint(order_id))
 
         with open(file_path, 'r') as filename:
@@ -1098,10 +1126,10 @@ class Server(object):
 
             contract["refund"] = refund_json["refund"]
             self.db.sales.update_status(order_id, 7)
-            file_path = DATA_FOLDER + "store/contracts/trade receipts/" + order_id + ".json"
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "trade receipts", order_id + ".json")
             with open(file_path, 'w') as outfile:
                 outfile.write(json.dumps(contract, indent=4))
-            file_path = DATA_FOLDER + "store/contracts/in progress/" + order_id + ".json"
+            file_path = os.path.join(DATA_FOLDER, "store", "contracts", "in progress", order_id + ".json")
             if os.path.exists(file_path):
                 os.remove(file_path)
 
@@ -1138,7 +1166,7 @@ class Server(object):
         try:
             if self.protocol.multiplexer is None:
                 return reactor.callLater(1, self.update_listings)
-            fname = DATA_FOLDER + "store/listings.pickle"
+            fname = os.path.join(DATA_FOLDER, "store", "listings.pickle")
             if os.path.exists(fname):
                 with open(fname, 'r') as f:
                     data = pickle.load(f)
@@ -1177,57 +1205,72 @@ class Server(object):
             return
         keychain = KeyChain(self.db)
         for listing in l.listing:
-            contract_hash = listing.contract_hash
-            c = Contract(self.db, hash_value=contract_hash, testnet=self.protocol.multiplexer.testnet)
-            contract_moderators = []
-            if "moderators" in c.contract["vendor_offer"]["listing"]:
-                for m in c.contract["vendor_offer"]["listing"]["moderators"]:
-                    contract_moderators.append(m["guid"])
-            mods_to_remove = list(set(contract_moderators) - set(moderator_list))
-            mods_to_add = list(set(moderator_list) - set(contract_moderators))
-            for mod in mods_to_add:
-                mod_info = self.db.moderators.get_moderator(mod)
-                if mod_info is not None:
-                    moderator_json = {
-                        "guid": mod,
-                        "name": mod_info[5],
-                        "avatar": mod_info[7].encode("hex"),
-                        "short_description": mod_info[6],
-                        "fee": str(mod_info[8]) + "%",
-                        "blockchain_id": mod_info[4],
-                        "pubkeys": {
-                            "guid": mod_info[1].encode("hex"),
-                            "bitcoin": {
-                                "key": mod_info[2].encode("hex"),
-                                "signature": base64.b64encode(mod_info[3])
+            try:
+                contract_hash = listing.contract_hash
+                c = Contract(self.db, hash_value=contract_hash, testnet=self.protocol.multiplexer.testnet)
+                contract_moderators = []
+                if "moderators" in c.contract["vendor_offer"]["listing"]:
+                    for m in c.contract["vendor_offer"]["listing"]["moderators"]:
+                        contract_moderators.append(m["guid"])
+                mods_to_remove = list(set(contract_moderators) - set(moderator_list))
+                mods_to_add = list(set(moderator_list) - set(contract_moderators))
+                for mod in mods_to_add:
+                    mod_info = self.db.moderators.get_moderator(mod)
+                    if mod_info is not None:
+                        moderator_json = {
+                            "guid": mod,
+                            "name": mod_info[5],
+                            "avatar": mod_info[7].encode("hex"),
+                            "short_description": mod_info[6],
+                            "fee": str(mod_info[8]) + "%",
+                            "blockchain_id": mod_info[4],
+                            "pubkeys": {
+                                "guid": mod_info[1].encode("hex"),
+                                "bitcoin": {
+                                    "key": mod_info[2].encode("hex"),
+                                    "signature": base64.b64encode(mod_info[3])
+                                }
                             }
                         }
-                    }
-                    if "moderators" not in c.contract["vendor_offer"]["listing"]:
-                        c.contract["vendor_offer"]["listing"]["moderators"] = []
-                    c.contract["vendor_offer"]["listing"]["moderators"].append(moderator_json)
-            for mod in mods_to_remove:
-                for rem in c.contract["vendor_offer"]["listing"]["moderators"]:
-                    if rem["guid"] == mod:
-                        c.contract["vendor_offer"]["listing"]["moderators"].remove(rem)
-            if "moderators" in c.contract["vendor_offer"]["listing"] and \
-                            len(c.contract["vendor_offer"]["listing"]["moderators"]) == 0:
-                del c.contract["vendor_offer"]["listing"]["moderators"]
+                        if "moderators" not in c.contract["vendor_offer"]["listing"]:
+                            c.contract["vendor_offer"]["listing"]["moderators"] = []
+                        c.contract["vendor_offer"]["listing"]["moderators"].append(moderator_json)
+                for mod in mods_to_remove:
+                    for rem in c.contract["vendor_offer"]["listing"]["moderators"]:
+                        if rem["guid"] == mod:
+                            c.contract["vendor_offer"]["listing"]["moderators"].remove(rem)
+                if "moderators" in c.contract["vendor_offer"]["listing"] and \
+                                len(c.contract["vendor_offer"]["listing"]["moderators"]) == 0:
+                    del c.contract["vendor_offer"]["listing"]["moderators"]
 
-            listing = json.dumps(c.contract["vendor_offer"]["listing"], indent=4)
-            c.contract["vendor_offer"]["signatures"] = {}
-            c.contract["vendor_offer"]["signatures"]["guid"] = \
-                base64.b64encode(keychain.signing_key.sign(listing)[:64])
-            c.contract["vendor_offer"]["signatures"]["bitcoin"] = \
-                bitcointools.encode_sig(*bitcointools.ecdsa_raw_sign(
-                    listing, bitcointools.bip32_extract_key(keychain.bitcoin_master_privkey)))
-            c.previous_title = None
-            c.save()
+                listing = json.dumps(c.contract["vendor_offer"]["listing"], indent=4)
+                c.contract["vendor_offer"]["signatures"] = {}
+                c.contract["vendor_offer"]["signatures"]["guid"] = \
+                    base64.b64encode(keychain.signing_key.sign(listing)[:64])
+                c.contract["vendor_offer"]["signatures"]["bitcoin"] = \
+                    bitcointools.encode_sig(*bitcointools.ecdsa_raw_sign(
+                        listing, bitcointools.bip32_extract_key(keychain.bitcoin_master_privkey)))
+                c.previous_title = None
+                c.save()
+            except Exception:
+                pass
 
     @staticmethod
     def cache(file_to_save, filename):
         """
         Saves the file to a cache folder override previous versions if any.
         """
-        with open(DATA_FOLDER + "cache/" + filename, 'wb') as outfile:
+        with open(os.path.join(DATA_FOLDER, "cache", filename), 'wb') as outfile:
             outfile.write(file_to_save)
+
+    @staticmethod
+    def load_from_cache(filename):
+        """
+        Loads a file from cache
+        """
+        filepath = DATA_FOLDER + "cache/" + filename
+        if not os.path.exists(filepath):
+            return None
+        with open(filepath, "r") as filename:
+            f = filename.read()
+        return f

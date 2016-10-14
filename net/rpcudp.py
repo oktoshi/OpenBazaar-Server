@@ -50,13 +50,8 @@ class RPCProtocol:
             connection.shutdown()
             return False
 
-        if message.protoVer < PROTOCOL_VERSION:
-            self.log.warning("received message from %s with incompatible protocol version." %
-                             str(connection.dest_addr))
-            connection.shutdown()
-            return False
-
-        self.multiplexer.vendors[sender.id] = sender
+        if sender.vendor:
+            self.multiplexer.vendors[sender.id] = sender
 
         msgID = message.messageID
         if message.command == NOT_FOUND:
@@ -68,8 +63,7 @@ class RPCProtocol:
         elif message.command != NOT_FOUND:
             ban_score.process_message(connection.dest_addr, message)
             self._acceptRequest(msgID, str(Command.Name(message.command)).lower(), data, sender, connection)
-        else:
-            ban_score.process_message(connection.dest_addr, message)
+
 
     def _acceptResponse(self, msgID, data, sender):
         if data is not None:
@@ -173,7 +167,6 @@ class RPCProtocol:
             m.testnet = self.multiplexer.testnet
             m.signature = self.signing_key.sign(m.SerializeToString())[:64]
             data = m.SerializeToString()
-
 
             relay_addr = None
             if node.nat_type == SYMMETRIC or \
